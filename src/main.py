@@ -18,6 +18,7 @@ for directory in directories:
 
 NFOLDS = 5
 RANDOM_STATE = 42
+skf = StratifiedKFold(n_splits=NFOLDS, random_state=RANDOM_STATE)
 
 DATA = Path('data')
 TRAIN = DATA/"train.csv"
@@ -45,32 +46,29 @@ def get_y_fn(x):
 
 codes = np.array(['Fish', 'Flower', 'Gravel', 'Sugar'])
 
-
-# TODO: KFolds this
+# We count how many non-NAN labels are present for each image
+# Then we create our K-Fold splits based on this
 id_mask_count = train.loc[train['EncodedPixels'].isnull() == False, 'Image_Label'].apply(lambda x: x.split('_')[0]).value_counts().\
 reset_index().rename(columns={'index': 'img_id', 'Image_Label': 'count'})
-train_ids, valid_ids = train_test_split(id_mask_count['img_id'].values, random_state=42, stratify=id_mask_count['count'], test_size=0.1)
 
-def isValid(img_id):
-    filename = img_id.split('/')[-1]
-    return str(filename) in valid_ids
+for train_index, valid_index in skf.split(id_mask_count['img_id'].values, id_mask_count['count']):
 
-src = (SegmentationItemList.from_df(unique_images, DATA/('train_images'+str(SUFFIX)), cols='im_id')
-       .split_by_valid_func(isValid)
-       .label_from_func(get_y_fn, classes=codes))
+    src = (SegmentationItemList.from_df(unique_images, DATA/('train_images'+str(SUFFIX)), cols='im_id')
+        .split_by_idx(valid_index)
+        .label_from_func(get_y_fn, classes=codes))
 
-#TODO: Fix these
-transforms = get_transforms()
+    #TODO: Fix these
+    transforms = get_transforms()
 
-data = (src.transform(transforms, tfm_y=True, size=size)
-        .databunch(bs=batch_size)
-        .normalize(imagenet_stats))
+    data = (src.transform(transforms, tfm_y=True, size=size)
+            .databunch(bs=batch_size)
+            .normalize(imagenet_stats))
 
-learn = unet_learner(data, models.resnet18, metrics=[multiclass_dice], loss_func=BCEWithLogitsFlat(), model_dir=DATA)
+    learn = unet_learner(data, models.resnet18, metrics=[multiclass_dice], loss_func=BCEWithLogitsFlat(), model_dir=DATA)
 
-learn.fit_one_cycle(1, 1e-3)
-learn.unfreeze()
-learn.fit_one_cycle(10, slice(1e-6, 1e-3))
+    learn.fit_one_cycle(1, 1e-3)
+    learn.unfreeze()
+    learn.fit_one_cycle(10, slice(1e-6, 1e-3))
 
 
 
