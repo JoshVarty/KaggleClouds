@@ -4,6 +4,7 @@ __pycache__/
 *$py.class
 
 data/
+model_predictions/
 .vscode/
 
 # C extensions
