@@ -4,6 +4,27 @@ from PIL import Image
 
 from fastai.vision import pil2tensor, ImageSegment, SegmentationLabelList
 
+def get_training_image_size(original_size, multiple=32):
+    """
+    Our inputs to the network must by multiples of 32.
+    We'll find the closest size that both a multiple of 32 and greater than the image size
+    """
+
+    new_sizes = []
+
+    for dimension_size in original_size:
+
+        for j in range(20):
+            candidate_size = multiple * j
+            if candidate_size > dimension_size:
+                new_sizes.append(candidate_size)
+                break
+
+    if len(new_sizes) != len(original_size):
+        raise Exception("Could not find a valid size for the image")
+
+    return tuple(new_sizes)
+
 def multiclass_dice(logits, targets, iou=False, eps=1e-8):
     """
     Dice coefficient metric for multiclass binary target. 

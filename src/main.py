@@ -8,7 +8,7 @@ from sklearn.model_selection import train_test_split, StratifiedKFold
 from fastai.vision import SegmentationItemList, imagenet_stats, get_transforms, models
 from fastai.vision import unet_learner, BCEWithLogitsFlat, DatasetType, get_preds, load_learner
 
-from utils import multiclass_dice, overrideOpenMask
+from utils import multiclass_dice, overrideOpenMask, get_training_image_size
 
 NFOLDS = 2
 RANDOM_STATE = 42
@@ -25,13 +25,13 @@ for directory in directories:
     if not os.path.exists(directory):
         os.makedirs(directory)
 
-
 DATA = Path('data')
 TRAIN = DATA/"train.csv"
 TEST = DATA/"sample_submission.csv"
 
-#If we want to train on smaller images, we can add their suffix here
 size = (350,525)
+training_image_size = get_training_image_size(size)     #UNet requires that inputs are multiples of 32
+#If we want to train on smaller images, we can add their suffix here
 SUFFIX = "_" + str(size[0]) + "x" + str(size[1])        #eg. _350x525
 batch_size=8
 
@@ -78,16 +78,14 @@ for train_index, valid_index in skf.split(id_mask_count['img_id'].values, id_mas
         .split_by_idx(valid_index)
         .label_from_func(get_y_fn, classes=codes))
 
-    #TODO: Fix these
     transforms = get_transforms()
-
-    data = (src.transform(transforms, tfm_y=True, size=size)
+    data = (src.transform(transforms, tfm_y=True, size=training_image_size, resize_method=ResizeMethod.PAD, padding_mode="zeros")
             .databunch(bs=batch_size)
             .normalize(imagenet_stats))
 
     learn = unet_learner(data, models.resnet18, metrics=[multiclass_dice], loss_func=BCEWithLogitsFlat(), model_dir=DATA)
 
-    learn.fit_one_cycle(1, 1e-3)
+    #learn.fit_one_cycle(1, 1e-3)
     #learn.unfreeze()
     #learn.fit_one_cycle(1, slice(1e-6, 1e-3))
     #valid_dice_score = learn.recorder.metrics[-1]
