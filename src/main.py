@@ -6,9 +6,34 @@ import numpy as np
 from pathlib import Path
 from sklearn.model_selection import train_test_split, StratifiedKFold
 from fastai.vision import SegmentationItemList, imagenet_stats, get_transforms, models
-from fastai.vision import unet_learner, BCEWithLogitsFlat, DatasetType, get_preds, load_learner
+from fastai.vision import unet_learner, BCEWithLogitsFlat, DatasetType, load_learner
+from fastai.vision import ResizeMethod, EmptyLabel
 
 from utils import multiclass_dice, overrideOpenMask, get_training_image_size
+
+#HACK: To use custom load learner
+import torch
+from fastai.basic_train import load_callback
+from fastai.vision import is_pathlike, defaults, LabelLists
+#HACK: To use custom load learner
+
+
+def custom_load_learner(path, file='export.pkl', test=None, **db_kwargs):
+    "Load a `Learner` object saved with `export_state` in `path/file` with empty data, optionally add `test` and load on `cpu`. `file` can be file-like (file or buffer)"
+    source = Path(path)/file if is_pathlike(file) else file
+    state = torch.load(source, map_location='cpu') if defaults.device == torch.device('cpu') else torch.load(source)
+    model = state.pop('model')
+    src = LabelLists.load_state(path, state.pop('data'))
+    if test is not None: src.add_test(test, tfm_y=False)
+    data = src.databunch(**db_kwargs)
+    cb_state = state.pop('cb_state')
+    clas_func = state.pop('cls')
+    res = clas_func(data, model, **state)
+    res.callback_fns = state['callback_fns'] #to avoid duplicates
+    res.callbacks = [load_callback(c,s, res) for c,s in cb_state.items()]
+    return res
+
+
 
 NFOLDS = 2
 RANDOM_STATE = 42
@@ -37,6 +62,8 @@ batch_size=8
 
 train = pd.read_csv(TRAIN)
 test = pd.read_csv(TEST)
+train = train.iloc[:300]
+#test = test.iloc[:300]
 train['label'] = train['Image_Label'].apply(lambda x: x.split('_')[1])
 train['im_id'] = train['Image_Label'].apply(lambda x: x.split('_')[0])
 test['label'] = test['Image_Label'].apply(lambda x: x.split('_')[1])
@@ -93,27 +120,38 @@ for train_index, valid_index in skf.split(id_mask_count['img_id'].values, id_mas
 
     #Save model
     filename = MODEL_NAME + '_' + str(i)
-    learn.export(learn.export(file=filename))
+    print(filename)
+    learn.export()
 
     # Generate test predictions, chunk-by-chunk based on this single fold
-    numItems = (len(unique_test_images) + 1) // 10
+    numItems = (len(unique_test_images) + 1) // 50
     for i in range(10):
         start = i * numItems
         end = min((i + 1) * numItems, len(unique_test_images) - 1)
 
         test_src = SegmentationItemList.from_df(unique_test_images[start:end], DATA/('test_images'+str(SUFFIX)), cols='im_id')
-        learn = load_learner(filename, test=test_src)
-        preds, y = get_preds(ds_type=DatasetType.Test)
+
+        # #hack
+        # def no_tfms(self, x, **kwargs): return x
+        # EmptyLabel.apply_tfms = no_tfms
+        # #hack
+        learn = custom_load_learner(DATA/('train_images'+str(SUFFIX)), test=test_src)
+        preds, y = learn.get_preds(ds_type=DatasetType.Test)
         preds = preds / NFOLDS
+
+        print(len(preds))
 
         for i, row in unique_test_images[start:end].iterrows():
 
-            im_id = row['im_id']
+            predictionId = row['im_id'] + ".npy"
             current_pred = preds[i]
+            # We have to correct for the resizing/padding of our original images
+            # To do this, we take a crop of our prediction in the proper size
+            valid_pred = current_pred[:, :size[0], :size[1]]
 
-            path = Path("model_predictions")/im_id
+            path = Path("model_predictions")/predictionId
             saved_pred = np.load(path)
-            saved_pred = saved_pred + current_pred
+            saved_pred = saved_pred + valid_pred.numpy()
             np.save(path, saved_pred)
 
     i = i + 1
@@ -123,6 +161,9 @@ print("Total Dice", score)
 
 print("Saving code...")
 shutil.copyfile(os.path.basename(__file__), 'model_source/{}__{}.py'.format(MODEL_NAME, str(score)))
+
+
+
 
 
 
