@@ -1,6 +1,10 @@
 import torch
 import numpy as np
+import pandas as pd
 from PIL import Image
+from pathlib import Path
+from tqdm import tqdm
+import cv2
 
 from fastai.vision import pil2tensor, ImageSegment, SegmentationLabelList
 
@@ -72,3 +76,63 @@ def overrideOpenMask():
         
     #Open image with our custom method
     SegmentationLabelList.open = custom_open
+
+
+def mask2rle(img):
+    '''
+    Convert mask to rle.
+    img: numpy array, 1 - mask, 0 - background
+    Returns run length as string formated
+    '''
+    pixels= img.T.flatten()
+    pixels = np.concatenate([[0], pixels, [0]])
+    runs = np.where(pixels[1:] != pixels[:-1])[0] + 1
+    runs[1::2] -= runs[::2]
+    return ' '.join(str(x) for x in runs)
+
+def post_process(probability, threshold, min_size):
+    """
+    Post processing of each predicted mask, components with lesser number of pixels
+    than `min_size` are ignored
+    """
+    # don't remember where I saw it
+    mask = cv2.threshold(probability, threshold, 1, cv2.THRESH_BINARY)[1]
+    num_component, component = cv2.connectedComponents(mask.astype(np.uint8))
+    predictions = np.zeros((350, 525), np.float32)
+    num = 0
+    for c in range(1, num_component):
+        p = (component == c)
+        if p.sum() > min_size:
+            predictions[p] = 1
+            num += 1
+    return predictions, num
+
+codes = np.array(['Fish', 'Flower', 'Gravel', 'Sugar'])
+
+def convertMasksToRle(test):
+    unique_test_images = test.iloc[::4, :]
+
+    for i, row in tqdm(unique_test_images.iterrows()):
+
+        predictionId = row['im_id'] + ".npy"
+        path = Path("model_predictions")/predictionId
+        saved_pred = np.load(path)
+
+        #TODO: Find good values for threshold and min_size
+        fishPreds, nFish = post_process(saved_pred[0], 0.5, 10)
+        flowerPreds, nFlower = post_process(saved_pred[1], 0.5, 10)
+        gravelPreds, nGravel = post_process(saved_pred[2], 0.5, 10)
+        sugarPreds, nSugar = post_process(saved_pred[3], 0.5, 10)
+
+        fishRle = mask2rle(fishPreds)
+        flowerRle = mask2rle(flowerPreds)
+        gravelRle = mask2rle(gravelPreds)
+        sugarRle = mask2rle(sugarPreds)
+
+        #Save in dataframe
+        test.loc[test['Image_Label'] == row['im_id'] + "_Fish", 'EncodedPixels'] = fishRle
+        test.loc[test['Image_Label'] == row['im_id'] + "_Flower", 'EncodedPixels'] = flowerRle
+        test.loc[test['Image_Label'] == row['im_id'] + "_Gravel", 'EncodedPixels'] = gravelRle
+        test.loc[test['Image_Label'] == row['im_id'] + "_Sugar", 'EncodedPixels'] = sugarRle
+
+    return test

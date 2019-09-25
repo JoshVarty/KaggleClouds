@@ -8,32 +8,10 @@ from sklearn.model_selection import train_test_split, StratifiedKFold
 from fastai.vision import SegmentationItemList, imagenet_stats, get_transforms, models
 from fastai.vision import unet_learner, BCEWithLogitsFlat, DatasetType, load_learner
 from fastai.vision import ResizeMethod, EmptyLabel
+from tqdm import tqdm
 
 from utils import multiclass_dice, overrideOpenMask, get_training_image_size
-
-#HACK: To use custom load learner
-import torch
-from fastai.basic_train import load_callback
-from fastai.vision import is_pathlike, defaults, LabelLists
-#HACK: To use custom load learner
-
-
-def custom_load_learner(path, file='export.pkl', test=None, **db_kwargs):
-    "Load a `Learner` object saved with `export_state` in `path/file` with empty data, optionally add `test` and load on `cpu`. `file` can be file-like (file or buffer)"
-    source = Path(path)/file if is_pathlike(file) else file
-    state = torch.load(source, map_location='cpu') if defaults.device == torch.device('cpu') else torch.load(source)
-    model = state.pop('model')
-    src = LabelLists.load_state(path, state.pop('data'))
-    if test is not None: src.add_test(test, tfm_y=False)
-    data = src.databunch(**db_kwargs)
-    cb_state = state.pop('cb_state')
-    clas_func = state.pop('cls')
-    res = clas_func(data, model, **state)
-    res.callback_fns = state['callback_fns'] #to avoid duplicates
-    res.callbacks = [load_callback(c,s, res) for c,s in cb_state.items()]
-    return res
-
-
+from utils import convertMasksToRle, post_process
 
 NFOLDS = 2
 RANDOM_STATE = 42
@@ -45,7 +23,7 @@ print("Working dir", os.getcwd())
 print("Model: {}".format(MODEL_NAME))
 
 # Make required folders if they're not already present
-directories = ['./kfolds', './model_predictions', './model_source']
+directories = ['./kfolds', './model_predictions', './model_source', './submissions']
 for directory in directories:
     if not os.path.exists(directory):
         os.makedirs(directory)
@@ -63,13 +41,13 @@ batch_size=8
 train = pd.read_csv(TRAIN)
 test = pd.read_csv(TEST)
 train = train.iloc[:300]
-#test = test.iloc[:300]
 train['label'] = train['Image_Label'].apply(lambda x: x.split('_')[1])
 train['im_id'] = train['Image_Label'].apply(lambda x: x.split('_')[0])
 test['label'] = test['Image_Label'].apply(lambda x: x.split('_')[1])
 test['im_id'] = test['Image_Label'].apply(lambda x: x.split('_')[0])
 
 unique_images = train.iloc[::4, :]
+unique_test_images = test.iloc[::4, :]
 
 #Ensure we open our 4D masks properly
 overrideOpenMask()
@@ -91,14 +69,13 @@ all_dice_scores = []
 
 # Create empty predictions for each of the test images
 # We have to save them to disk because we don't have enough memory :(
-unique_test_images = test.iloc[::4, :]
 for index, row in unique_test_images.iterrows():
     im_id = row["im_id"]
     empty_preds = np.zeros((len(codes), size[0], size[1]))
     path = Path("model_predictions")/im_id
     np.save(path, empty_preds)
 
-i = 0
+currentFold = 0
 for train_index, valid_index in skf.split(id_mask_count['img_id'].values, id_mask_count['count']):
 
     src = (SegmentationItemList.from_df(unique_images, DATA/('train_images'+str(SUFFIX)), cols='im_id')
@@ -119,15 +96,16 @@ for train_index, valid_index in skf.split(id_mask_count['img_id'].values, id_mas
     #all_dice_scores.append(valid_dice_score)
 
     #Save model
-    filename = MODEL_NAME + '_' + str(i)
+    filename = MODEL_NAME + '_' + str(currentFold)
     print(filename)
     learn.export()
 
     # Generate test predictions, chunk-by-chunk based on this single fold
-    numItems = (len(unique_test_images) + 1) // 50
-    for i in range(10):
-        start = i * numItems
-        end = min((i + 1) * numItems, len(unique_test_images) - 1)
+    numberOfBatches = (len(unique_test_images) + 1) // batch_size
+
+    for i in tqdm(range(numberOfBatches))   :
+        start = i * batch_size
+        end = min((i + 1) * batch_size, len(unique_test_images) - 1)
 
         test_src = SegmentationItemList.from_df(unique_test_images[start:end], DATA/('test_images'+str(SUFFIX)), cols='im_id')
 
@@ -135,16 +113,16 @@ for train_index, valid_index in skf.split(id_mask_count['img_id'].values, id_mas
         # def no_tfms(self, x, **kwargs): return x
         # EmptyLabel.apply_tfms = no_tfms
         # #hack
-        learn = custom_load_learner(DATA/('train_images'+str(SUFFIX)), test=test_src)
+        learn = load_learner(DATA/('train_images'+str(SUFFIX)), test=test_src, tfm_y=False)
         preds, y = learn.get_preds(ds_type=DatasetType.Test)
-        preds = preds / NFOLDS
+        preds = torch.sigmoid(preds) / NFOLDS
 
-        print(len(preds))
+        for j, current_pred in enumerate(preds):
 
-        for i, row in unique_test_images[start:end].iterrows():
-
+            currentIndex = start + j
+            row = unique_test_images.iloc[currentIndex]
             predictionId = row['im_id'] + ".npy"
-            current_pred = preds[i]
+
             # We have to correct for the resizing/padding of our original images
             # To do this, we take a crop of our prediction in the proper size
             valid_pred = current_pred[:, :size[0], :size[1]]
@@ -154,13 +132,22 @@ for train_index, valid_index in skf.split(id_mask_count['img_id'].values, id_mas
             saved_pred = saved_pred + valid_pred.numpy()
             np.save(path, saved_pred)
 
-    i = i + 1
+
+    currentFold = currentFold + 1
+
 
 score = np.mean(all_dice_scores)
 print("Total Dice", score)
 
 print("Saving code...")
 shutil.copyfile(os.path.basename(__file__), 'model_source/{}__{}.py'.format(MODEL_NAME, str(score)))
+
+#Generate the submission
+submission = convertMasksToRle(test)
+submission = submission.drop(columns=['label', 'im_id'])
+submission.to_csv("submissions/{}__{}.csv".format(filename, str(score)), index=False)
+
+
 
 
 
