@@ -90,7 +90,7 @@ def mask2rle(img):
     runs[1::2] -= runs[::2]
     return ' '.join(str(x) for x in runs)
 
-def post_process(probability, threshold, min_size):
+def post_process(probability, threshold, min_size, shape):
     """
     Post processing of each predicted mask, components with lesser number of pixels
     than `min_size` are ignored
@@ -98,7 +98,7 @@ def post_process(probability, threshold, min_size):
     # don't remember where I saw it
     mask = cv2.threshold(probability, threshold, 1, cv2.THRESH_BINARY)[1]
     num_component, component = cv2.connectedComponents(mask.astype(np.uint8))
-    predictions = np.zeros((350, 525), np.float32)
+    predictions = np.zeros(shape, np.float32)
     num = 0
     for c in range(1, num_component):
         p = (component == c)
@@ -107,7 +107,16 @@ def post_process(probability, threshold, min_size):
             num += 1
     return predictions, num
 
-codes = np.array(['Fish', 'Flower', 'Gravel', 'Sugar'])
+
+def convert_mask_to_rle(mask, threshold, min_size):
+    preds, numPreds = post_process(mask, threshold, min_size, mask.shape)
+    fishRle = mask2rle(preds)
+    return fishRle
+
+
+
+
+    
 
 def convertMasksToRle(test):
     unique_test_images = test.iloc[::4, :]
@@ -119,15 +128,10 @@ def convertMasksToRle(test):
         saved_pred = np.load(path)
 
         #TODO: Find good values for threshold and min_size
-        fishPreds, nFish = post_process(saved_pred[0], 0.5, 10)
-        flowerPreds, nFlower = post_process(saved_pred[1], 0.5, 10)
-        gravelPreds, nGravel = post_process(saved_pred[2], 0.5, 10)
-        sugarPreds, nSugar = post_process(saved_pred[3], 0.5, 10)
-
-        fishRle = mask2rle(fishPreds)
-        flowerRle = mask2rle(flowerPreds)
-        gravelRle = mask2rle(gravelPreds)
-        sugarRle = mask2rle(sugarPreds)
+        fishRle = convert_mask_to_rle(saved_pred[0], 0.5, 10000)
+        flowerRle = convert_mask_to_rle(saved_pred[1], 0.5, 10000)
+        gravelRle = convert_mask_to_rle(saved_pred[2], 0.5, 10000)
+        sugarRle = convert_mask_to_rle(saved_pred[3], 0.5, 10000)
 
         #Save in dataframe
         test.loc[test['Image_Label'] == row['im_id'] + "_Fish", 'EncodedPixels'] = fishRle
@@ -136,3 +140,51 @@ def convertMasksToRle(test):
         test.loc[test['Image_Label'] == row['im_id'] + "_Sugar", 'EncodedPixels'] = sugarRle
 
     return test
+
+def create_channel_from_rle(encoded_pixels, shape, value=0):
+    newChannel = np.zeros(shape[0] * shape[1], dtype=np.uint8)
+    
+    s = encoded_pixels.split()
+    starts, lengths = [np.asarray(x, dtype=int) for x in (s[0:][::2], s[1:][::2])]
+    starts -= 1
+    ends = starts + lengths
+    for lo, hi in zip(starts, ends):
+        newChannel[lo:hi] = 1
+        
+    newChannel = newChannel.reshape(shape, order='F')
+    return newChannel
+
+
+def create_mask_for_image(df, index):
+    fish = df.iloc[index]
+    flower = df.iloc[index + 1]
+    gravel = df.iloc[index + 2]
+    sugar = df.iloc[index + 3]
+    
+    fullPath = "data/train_images/" + fish['im_id']
+    im = Image.open(fullPath)
+
+    shape = im.size
+    #shape = (1400, 2100)
+    
+    fishChannel = np.zeros(shape, dtype=np.uint8)
+    flowerChannel = np.zeros(shape, dtype=np.uint8)
+    gravelChannel = np.zeros(shape, dtype=np.uint8)
+    sugarChannel = np.zeros(shape, dtype=np.uint8)
+    
+    if isinstance(fish['EncodedPixels'], str):
+        fishChannel = create_channel_from_rle(fish['EncodedPixels'], shape)
+    
+    if isinstance(flower['EncodedPixels'], str):
+        flowerChannel = create_channel_from_rle(flower['EncodedPixels'], shape)
+    
+    if isinstance(gravel['EncodedPixels'], str):
+        gravelChannel = create_channel_from_rle(gravel['EncodedPixels'], shape)
+    
+    if isinstance(sugar['EncodedPixels'], str):
+        sugarChannel = create_channel_from_rle(sugar['EncodedPixels'], shape, 1)
+   
+    #Create fake RGBA image
+    newImage = np.stack([fishChannel, flowerChannel, gravelChannel, sugarChannel], axis=-1)
+
+    return newImage
