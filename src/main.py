@@ -9,9 +9,41 @@ from fastai.vision import SegmentationItemList, imagenet_stats, get_transforms, 
 from fastai.vision import unet_learner, BCEWithLogitsFlat, DatasetType, load_learner
 from fastai.vision import ResizeMethod, EmptyLabel
 from tqdm import tqdm
-
+from functools import partial
 from utils import multiclass_dice, overrideOpenMask, get_training_image_size
 from utils import convertMasksToRle, post_process
+
+def multiclass_dice_threshold(logits, targets, threshold=0.5, iou=False, eps=1e-8):
+    """
+    Dice coefficient metric for multiclass binary target. 
+    If iou=True, returns iou metric, classic for segmentation problems.
+    """
+    
+    n = targets.shape[0]   #Batch size of 4
+    
+    #Flatten logits and targets
+    logits = logits.view(n,-1)  
+    targets = targets.view(n,-1).float()
+    
+    #Convert logits to probabilities
+    probs = torch.sigmoid(logits)
+    
+    preds = probs
+    preds[preds >= threshold] = 1
+    preds[preds < threshold] = 0
+    
+    intersect = (preds * targets).sum(dim=1).float()
+    union = (preds + targets).sum(dim=1).float()
+    
+    if not iou: 
+        l = 2. * intersect / union
+    else: 
+        l = intersect / (union-intersect+eps)
+        
+    # The Dice coefficient is defined to be 1 when both X and Y are empty.
+    # That said, we'd get a divide-by-zero-exception if union was 0 anyways...
+    l[union == 0.] = 1.
+    return l.mean()
 
 NFOLDS = 2
 RANDOM_STATE = 42
@@ -40,7 +72,7 @@ batch_size=8
 
 train = pd.read_csv(TRAIN)
 test = pd.read_csv(TEST)
-train = train.iloc[:300]
+train = train.iloc[:4000]
 train['label'] = train['Image_Label'].apply(lambda x: x.split('_')[1])
 train['im_id'] = train['Image_Label'].apply(lambda x: x.split('_')[0])
 test['label'] = test['Image_Label'].apply(lambda x: x.split('_')[1])
@@ -67,13 +99,12 @@ reset_index().rename(columns={'index': 'img_id', 'Image_Label': 'count'})
 
 all_dice_scores = []
 
-# Create empty predictions for each of the test images
-# We have to save them to disk because we don't have enough memory :(
-for index, row in unique_test_images.iterrows():
-    im_id = row["im_id"]
-    empty_preds = np.zeros((len(codes), size[0], size[1]))
-    path = Path("model_predictions")/im_id
-    np.save(path, empty_preds)
+test_preds = np.zeros((len(unique_test_images), len(codes), size[0], size[1]))
+
+#Loss metrics
+dice_25 = partial(multiclass_dice_threshold, threshold=0.25)
+dice_50 = partial(multiclass_dice_threshold, threshold=0.50)
+dice_75 = partial(multiclass_dice_threshold, threshold=0.75)
 
 currentFold = 0
 for train_index, valid_index in skf.split(id_mask_count['img_id'].values, id_mask_count['count']):
@@ -82,18 +113,20 @@ for train_index, valid_index in skf.split(id_mask_count['img_id'].values, id_mas
         .split_by_idx(valid_index)
         .label_from_func(get_y_fn, classes=codes))
 
-    transforms = get_transforms()
+    transforms = get_transforms(max_warp=0, max_rotate=0)
     data = (src.transform(transforms, tfm_y=True, size=training_image_size, resize_method=ResizeMethod.PAD, padding_mode="zeros")
             .databunch(bs=batch_size)
             .normalize(imagenet_stats))
 
-    learn = unet_learner(data, models.resnet18, metrics=[multiclass_dice], loss_func=BCEWithLogitsFlat(), model_dir=DATA)
 
-    #learn.fit_one_cycle(1, 1e-3)
-    #learn.unfreeze()
-    #learn.fit_one_cycle(1, slice(1e-6, 1e-3))
-    #valid_dice_score = learn.recorder.metrics[-1]
-    #all_dice_scores.append(valid_dice_score)
+    learn = unet_learner(data, models.xresnet18, pretrained=False, metrics=[multiclass_dice, dice_25, dice_50, dice_75], loss_func=BCEWithLogitsFlat(), model_dir=DATA)
+
+    learn.fit_one_cycle(10, 1e-3)
+    learn.unfreeze()
+    learn.fit_one_cycle(30, slice(1e-6, 1e-3))
+    valid_dice_score = learn.recorder.metrics[-1]
+    print("DEBUG", valid_dice_score)
+    all_dice_scores.append(valid_dice_score)
 
     #Save model
     filename = MODEL_NAME + '_' + str(currentFold)
@@ -109,13 +142,9 @@ for train_index, valid_index in skf.split(id_mask_count['img_id'].values, id_mas
 
         test_src = SegmentationItemList.from_df(unique_test_images[start:end], DATA/('test_images'+str(SUFFIX)), cols='im_id')
 
-        # #hack
-        # def no_tfms(self, x, **kwargs): return x
-        # EmptyLabel.apply_tfms = no_tfms
-        # #hack
         learn = load_learner(DATA/('train_images'+str(SUFFIX)), test=test_src, tfm_y=False)
-        preds, y = learn.get_preds(ds_type=DatasetType.Test)
-        preds = torch.sigmoid(preds) / NFOLDS
+        preds, _ = learn.get_preds(ds_type=DatasetType.Test)
+        preds = preds / NFOLDS
 
         for j, current_pred in enumerate(preds):
 
@@ -126,24 +155,18 @@ for train_index, valid_index in skf.split(id_mask_count['img_id'].values, id_mas
             # We have to correct for the resizing/padding of our original images
             # To do this, we take a crop of our prediction in the proper size
             valid_pred = current_pred[:, :size[0], :size[1]]
-
-            path = Path("model_predictions")/predictionId
-            saved_pred = np.load(path)
-            saved_pred = saved_pred + valid_pred.numpy()
-            np.save(path, saved_pred)
-
+            test_preds[j] = test_preds[j] + valid_pred.numpy()
 
     currentFold = currentFold + 1
-
 
 score = np.mean(all_dice_scores)
 print("Total Dice", score)
 
 print("Saving code...")
-shutil.copyfile(os.path.basename(__file__), 'model_source/{}__{}.py'.format(MODEL_NAME, str(score)))
+shutil.copyfile(__file__, 'model_source/{}__{}.py'.format(MODEL_NAME, str(score)))
 
 #Generate the submission
-submission = convertMasksToRle(test)
+submission = convertMasksToRle(test, test_preds, threshold=0.5, min_size=10000)
 submission = submission.drop(columns=['label', 'im_id'])
 submission.to_csv("submissions/{}__{}.csv".format(filename, str(score)), index=False)
 
