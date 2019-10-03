@@ -12,6 +12,7 @@ from tqdm import tqdm
 from functools import partial
 from utils import multiclass_dice, overrideOpenMask, get_training_image_size
 from utils import convertMasksToRle, post_process
+from utils import BCEDiceLoss
 
 def multiclass_dice_threshold(logits, targets, threshold=0.5, iou=False, eps=1e-8):
     """
@@ -99,12 +100,10 @@ reset_index().rename(columns={'index': 'img_id', 'Image_Label': 'count'})
 
 all_dice_scores = []
 
-test_preds = np.zeros((len(unique_test_images), len(codes), size[0], size[1]))
+test_preds = np.zeros((len(unique_test_images), len(codes), size[0], size[1]), dtype=np.float32)
 
 #Loss metrics
-dice_25 = partial(multiclass_dice_threshold, threshold=0.25)
 dice_50 = partial(multiclass_dice_threshold, threshold=0.50)
-dice_75 = partial(multiclass_dice_threshold, threshold=0.75)
 
 currentFold = 0
 for train_index, valid_index in skf.split(id_mask_count['img_id'].values, id_mask_count['count']):
@@ -119,7 +118,7 @@ for train_index, valid_index in skf.split(id_mask_count['img_id'].values, id_mas
             .normalize(imagenet_stats))
 
 
-    learn = unet_learner(data, models.xresnet18, pretrained=False, metrics=[multiclass_dice, dice_25, dice_50, dice_75], loss_func=BCEWithLogitsFlat(), model_dir=DATA)
+    learn = unet_learner(data, models.resnet18, pretrained=True, metrics=[multiclass_dice, dice_50], loss_func=BCEWithLogitsFlat(), model_dir=DATA)
 
     learn.fit_one_cycle(10, 1e-3)
     learn.unfreeze()
@@ -150,12 +149,12 @@ for train_index, valid_index in skf.split(id_mask_count['img_id'].values, id_mas
 
             currentIndex = start + j
             row = unique_test_images.iloc[currentIndex]
-            predictionId = row['im_id'] + ".npy"
 
             # We have to correct for the resizing/padding of our original images
             # To do this, we take a crop of our prediction in the proper size
             valid_pred = current_pred[:, :size[0], :size[1]]
-            test_preds[j] = test_preds[j] + valid_pred.numpy()
+
+            test_preds[currentIndex] = test_preds[currentIndex] + valid_pred.numpy()
 
     currentFold = currentFold + 1
 
