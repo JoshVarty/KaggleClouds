@@ -4,6 +4,9 @@ __pycache__/
 *$py.class
 
 data/
+model_source/
+submissions/
+distances/
 model_predictions/
 .vscode/
 
