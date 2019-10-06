@@ -21,6 +21,7 @@ In order to use this repository:
  - `/data` contains all training data
  - `/model_source` contains the exact `main.py` source code that lead to a given valid score
  - `/submissions` contains the generated submission `.csv` file for a given valid score
+ - `/tests` a handful of unit tests for run-length encoding conversions
  
  
  
