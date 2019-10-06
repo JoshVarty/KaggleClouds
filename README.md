@@ -15,7 +15,7 @@ This repository is comprised of exploratory notebooks and a single training scri
 In order to use this repository:
 
 1. Run all cells in `00_EDA.ipynb` to generate the masks
-2. Run `src/main.py` to produce
+2. Run `src/main.py` to produce a submission
 
 ## Folder Structure
  - `/data` contains all training data
