@@ -9,6 +9,7 @@ submissions/
 distances/
 model_predictions/
 .vscode/
+.idea/
 
 # C extensions
 *.so
