@@ -32,6 +32,33 @@ def get_training_image_size(original_size, multiple=32):
     return tuple(new_sizes)
 
 
+def multiclass_dice_probs(probs, targets, iou=False, eps=1e-8):
+    """
+    Dice coefficient metric for multiclass binary target with probs
+    """
+
+    n = targets.shape[0]  # Batch size of 4
+
+    # Flatten logits and targets
+    probs = probs.view(n, -1)
+    targets = targets.view(n, -1).float()
+
+    # Convert logits to probabilities
+    intersect = (probs * targets).sum(dim=1).float()
+    union = (probs + targets).sum(dim=1).float()
+
+    if not iou:
+        l = 2. * intersect / union
+    else:
+        l = intersect / (union - intersect + eps)
+
+    # The Dice coefficient is defined to be 1 when both X and Y are empty.
+    # That said, we'd get a divide-by-zero-exception if union was 0 anyways...
+    l[union == 0.] = 1.
+    return l.mean()
+    pass
+
+
 def multiclass_dice(logits, targets, iou=False, eps=1e-8):
     """
     Dice coefficient metric for multiclass binary target. 
@@ -144,7 +171,7 @@ def mask2rle(img):
     return ' '.join(str(x) for x in runs)
 
 
-def post_process(probability, threshold, min_size, shape):
+def post_process(probability, threshold, min_size):
     """
     Post processing of each predicted mask, components with lesser number of pixels
     than `min_size` are ignored
@@ -152,7 +179,7 @@ def post_process(probability, threshold, min_size, shape):
     # don't remember where I saw it
     mask = cv2.threshold(probability, threshold, 1, cv2.THRESH_BINARY)[1]
     num_component, component = cv2.connectedComponents(mask.astype(np.uint8))
-    predictions = np.zeros(shape, np.float32)
+    predictions = np.zeros(probability.shape, np.float32)
     num = 0
     for c in range(1, num_component):
         p = (component == c)
@@ -163,7 +190,7 @@ def post_process(probability, threshold, min_size, shape):
 
 
 def convert_mask_to_rle(mask, threshold, min_size):
-    preds, num_preds = post_process(mask, threshold, min_size, mask.shape)
+    preds, num_preds = post_process(mask, threshold, min_size)
     rle_mask = mask2rle(preds)
     return rle_mask
 
