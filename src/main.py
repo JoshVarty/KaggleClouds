@@ -1,6 +1,7 @@
 import os
 import torch
 import shutil
+import fastai
 import pandas as pd
 import numpy as np
 from pathlib import Path
@@ -10,8 +11,8 @@ from fastai.vision import unet_learner, BCEWithLogitsFlat, DatasetType, load_lea
 from fastai.vision import ResizeMethod, EmptyLabel
 from tqdm import tqdm
 from functools import partial
-from utils import multiclass_dice, overrideOpenMask, get_training_image_size
-from utils import convertMasksToRle, post_process
+from utils import multiclass_dice, override_open_mask, get_training_image_size
+from utils import convert_masks_to_rle, post_process
 from utils import BCEDiceLoss
 
 def multiclass_dice_threshold(logits, targets, threshold=0.5, iou=False, eps=1e-8):
@@ -47,13 +48,19 @@ def multiclass_dice_threshold(logits, targets, threshold=0.5, iou=False, eps=1e-
     return l.mean()
 
 NFOLDS = 2
+NTRAIN = 4000
 RANDOM_STATE = 42
 skf = StratifiedKFold(n_splits=NFOLDS, random_state=RANDOM_STATE)
 
 script_name = os.path.basename(__file__).split('.')[0]
-MODEL_NAME = "{0}__folds{1}".format(script_name, NFOLDS)
+MODEL_NAME = "{0}__folds{1}___{2}".format(script_name, NFOLDS, NTRAIN)
+if os.getcwd().endswith('src'):
+    # We want to be working in the root directory
+    os.chdir('../')
 print("Working dir", os.getcwd())
 print("Model: {}".format(MODEL_NAME))
+print("Torch : {}".format(torch.__version__))
+print("fastai : {}".format(fastai.__version__))
 
 # Make required folders if they're not already present
 directories = ['./kfolds', './model_predictions', './model_source', './submissions']
@@ -73,7 +80,7 @@ batch_size=8
 
 train = pd.read_csv(TRAIN)
 test = pd.read_csv(TEST)
-train = train.iloc[:4000]
+train = train.iloc[:NTRAIN]
 train['label'] = train['Image_Label'].apply(lambda x: x.split('_')[1])
 train['im_id'] = train['Image_Label'].apply(lambda x: x.split('_')[0])
 test['label'] = test['Image_Label'].apply(lambda x: x.split('_')[1])
@@ -83,7 +90,7 @@ unique_images = train.iloc[::4, :]
 unique_test_images = test.iloc[::4, :]
 
 #Ensure we open our 4D masks properly
-overrideOpenMask()
+override_open_mask()
 
 def get_y_fn(x):
     # Given a path to a training image, build the corresponding mask path
@@ -113,16 +120,15 @@ for train_index, valid_index in skf.split(id_mask_count['img_id'].values, id_mas
         .label_from_func(get_y_fn, classes=codes))
 
     transforms = get_transforms(max_warp=0, max_rotate=0)
-    data = (src.transform(transforms, tfm_y=True, size=training_image_size, resize_method=ResizeMethod.PAD, padding_mode="zeros")
+    data = (src.transform(get_transforms(), tfm_y=True, size=training_image_size, resize_method=ResizeMethod.PAD, padding_mode="zeros")
             .databunch(bs=batch_size)
             .normalize(imagenet_stats))
 
-
-    learn = unet_learner(data, models.resnet18, pretrained=True, metrics=[multiclass_dice, dice_50], loss_func=BCEWithLogitsFlat(), model_dir=DATA)
+    learn = unet_learner(data, models.resnet34, pretrained=True, metrics=[multiclass_dice, dice_50], loss_func=BCEDiceLoss(), model_dir=DATA)
 
     learn.fit_one_cycle(10, 1e-3)
     learn.unfreeze()
-    learn.fit_one_cycle(30, slice(1e-6, 1e-3))
+    learn.fit_one_cycle(60, slice(1e-6, 1e-3))
     valid_dice_score = learn.recorder.metrics[-1]
     print("DEBUG", valid_dice_score)
     all_dice_scores.append(valid_dice_score)
@@ -135,7 +141,7 @@ for train_index, valid_index in skf.split(id_mask_count['img_id'].values, id_mas
     # Generate test predictions, chunk-by-chunk based on this single fold
     numberOfBatches = (len(unique_test_images) + 1) // batch_size
 
-    for i in tqdm(range(numberOfBatches))   :
+    for i in tqdm(range(numberOfBatches)):
         start = i * batch_size
         end = min((i + 1) * batch_size, len(unique_test_images) - 1)
 
@@ -165,7 +171,7 @@ print("Saving code...")
 shutil.copyfile(__file__, 'model_source/{}__{}.py'.format(MODEL_NAME, str(score)))
 
 #Generate the submission
-submission = convertMasksToRle(test, test_preds, threshold=0.5, min_size=10000)
+submission = convert_masks_to_rle(test, test_preds, threshold=0.5, min_size=10000)
 submission = submission.drop(columns=['label', 'im_id'])
 submission.to_csv("submissions/{}__{}.csv".format(filename, str(score)), index=False)
 
