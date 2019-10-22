@@ -10,6 +10,7 @@ distances/
 model_predictions/
 .vscode/
 .idea/
+logs/
 
 # C extensions
 *.so
