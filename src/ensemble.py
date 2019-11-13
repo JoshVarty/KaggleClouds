@@ -90,17 +90,17 @@ def get_training_augmentation():
         albu.ShiftScaleRotate(scale_limit=(0.1, 0.1), rotate_limit=45, p=0.5, border_mode=0),
         albu.GridDistortion(p=0.5),
         albu.RandomContrast(limit=0.3, p=0.5),
-        albu.Resize(704, 1056),
-        albu.RandomCrop(704, 704)
+        #albu.Resize(448, 672),
+        #albu.PadIfNeeded(352, 544, border_mode=0)
     ]
-
     return albu.Compose(train_transform)
 
 
 def get_validation_augmentation():
     """Add paddings to make image shape divisible by 32"""
     test_transform = [
-        albu.Resize(704, 1056)  # Validate/test on full size images
+        #albu.Resize(448, 672),
+        #albu.PadIfNeeded(352, 544, border_mode=0),
     ]
     return albu.Compose(test_transform)
 
@@ -163,7 +163,7 @@ def make_mask(encoded_masks, shape: tuple = (1400, 2100)):
     """
     Create mask based on df, image name and shape.
     """
-    masks = np.zeros((shape[0], shape[1], 4), dtype=np.float32)
+    masks = np.zeros((shape[0], shape[1], 4), dtype=np.uint8)
 
     for idx, label in enumerate(encoded_masks.values):
         if label is not np.nan:
@@ -194,7 +194,10 @@ class CloudDataset(Dataset):
         masks = []
         for image_name in tqdm.tqdm(self.img_ids):
             encoded_masks = self.df.loc[self.df['im_id'] == image_name, 'EncodedPixels']
-            masks.append(encoded_masks)
+            mask = make_mask(encoded_masks)
+            small_mask = cv2.resize(mask, (672, 448))
+            del mask
+            masks.append(small_mask)
 
         return masks
 
@@ -202,6 +205,7 @@ class CloudDataset(Dataset):
         samples = []
         for image_name in tqdm.tqdm(self.img_ids):
             img = get_img(image_name, self.data_folder)
+            img = cv2.resize(img, (672, 448))
             samples.append(img)
 
         return samples
@@ -211,8 +215,7 @@ class CloudDataset(Dataset):
         img = self.samples[idx]
 
         if self.datatype != 'test':
-            encoded_masks = self.raw_masks[idx]
-            mask = make_mask(encoded_masks)
+            mask = self.raw_masks[idx]
         else:
             mask = np.zeros((img.shape[0], img.shape[1], 4), dtype=np.float32)
 
@@ -223,6 +226,11 @@ class CloudDataset(Dataset):
             preprocessed = self.preprocessing(image=img, mask=mask)
             img = preprocessed['image']
             mask = preprocessed['mask']
+
+        # We're resizing the mask because we're predicting with one less decoder
+        # mask = mask.transpose((1, 2, 0))
+        # mask = cv2.resize(mask, (544//2, 352//2))  # height and width are backward in cv2...
+        # mask = mask.transpose((2, 0, 1))
         return img, mask
 
     def __len__(self):
@@ -231,33 +239,111 @@ class CloudDataset(Dataset):
     def _clear(self):
         del self.samples[:]
 
-train = pd.read_csv(f'data/train.csv')
+
 sub = pd.read_csv(f'data/sample_submission.csv')
-
-train['label'] = train['Image_Label'].apply(lambda x: x.split('_')[1])
-train['im_id'] = train['Image_Label'].apply(lambda x: x.split('_')[0])
-
 sub['label'] = sub['Image_Label'].apply(lambda x: x.split('_')[1])
 sub['im_id'] = sub['Image_Label'].apply(lambda x: x.split('_')[0])
-
-id_mask_count = train.loc[train['EncodedPixels'].isnull() == False, 'Image_Label'].apply(
-    lambda x: x.split('_')[0]).value_counts().reset_index().rename(columns={'index': 'img_id', 'Image_Label': 'count'})
-train_ids, valid_ids = train_test_split(id_mask_count['img_id'].values, random_state=42, stratify=id_mask_count['count'], test_size=0.1)
 test_ids = sub['Image_Label'].apply(lambda x: x.split('_')[0]).drop_duplicates().values
-logdir = "./logs/segmentation"
-ENCODER = 'resnet50'
-ENCODER_WEIGHTS = 'satellite-resnet-50'
-DEVICE = 'cuda'
+
 ACTIVATION = None
+ENCODER_WEIGHTS = 'imagenet'
+DEVICE = 'cuda'
 
-model = smp.Unet(
-        encoder_name=ENCODER,
-        encoder_weights=ENCODER_WEIGHTS,
-        classes=4,
-        activation=ACTIVATION,
-    )
+# TODO: Create list/dictionary of logdirs with models we'd like to assemble
+# ENCODER = 'efficientnet-b2'
+# logdir = "./logs/segmentation"
 
-preprocessing_fn = smp.encoders.get_preprocessing_fn(ENCODER, 'imagenet')
+def generate_test_preds(ensemble_info):
 
+    test_preds = np.zeros((len(sub), 350, 525), dtype=np.float32)
+    num_models = len(ensemble_info)
+
+    for model_info in ensemble_info:
+
+        class_params = model_info['class_params']
+        encoder = model_info['encoder']
+        model_type = model_info['model_type']
+        logdir = model_info['logdir']
+
+        preprocessing_fn = smp.encoders.get_preprocessing_fn(encoder, ENCODER_WEIGHTS)
+
+        model = None
+        if model_type == 'unet':
+            model = smp.Unet(
+                encoder_name=encoder,
+                encoder_weights=ENCODER_WEIGHTS,
+                classes=4,
+                activation=ACTIVATION,
+            )
+        elif model_type == 'fpn':
+            model = smp.FPN(
+                encoder_name=encoder,
+                encoder_weights=ENCODER_WEIGHTS,
+                classes=4,
+                activation=ACTIVATION,
+            )
+        else:
+            raise NotImplementedError("We only support FPN and UNet")
+
+        runner = SupervisedRunner(model)
+
+        # HACK: We are loading a few examples from our dummy loader so catalyst will properly load the weights
+        # from our checkpoint
+        dummy_dataset = CloudDataset(df=sub, datatype='test', img_ids=test_ids[:1],  transforms=get_validation_augmentation(),
+                                     preprocessing=get_preprocessing(preprocessing_fn))
+        dummy_loader = DataLoader(dummy_dataset, batch_size=1, shuffle=False, num_workers=0)
+        loaders = {"test": dummy_loader}
+        runner.infer(
+            model=model,
+            loaders=loaders,
+            callbacks=[
+                CheckpointCallback(
+                    resume=f"{logdir}/checkpoints/best.pth"),
+                InferCallback()
+            ],
+        )
+
+        # Now we do real inference on the full dataset
+        test_dataset = CloudDataset(df=sub, datatype='test', img_ids=test_ids,  transforms=get_validation_augmentation(),
+                                    preprocessing=get_preprocessing(preprocessing_fn))
+        test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False, num_workers=0)
+
+        image_id = 0
+        for batch_index, test_batch in enumerate(tqdm.tqdm(test_loader)):
+            runner_out = runner.predict_batch({"features": test_batch[0].cuda()})['logits'].cpu().detach().numpy()
+            for preds in runner_out:
+
+                preds = preds.transpose((1, 2, 0))
+                preds = cv2.resize(preds, (525, 350))  # height and width are backward in cv2...
+                preds = preds.transpose((2, 0, 1))
+
+                idx = batch_index * 4
+                test_preds[idx + 0] += sigmoid(preds[0]) / num_models   # fish
+                test_preds[idx + 1] += sigmoid(preds[1]) / num_models   # flower
+                test_preds[idx + 2] += sigmoid(preds[2]) / num_models   # gravel
+                test_preds[idx + 3] += sigmoid(preds[3]) / num_models   # sugar
+
+    # Convert ensembled predictions to RLE predictions
+    encoded_pixels = []
+    for image_id, preds in enumerate(test_preds):
+
+        predict, num_predict = post_process(preds, class_params[image_id % 4][0], class_params[image_id % 4][1])
+        if num_predict == 0:
+            encoded_pixels.append('')
+        else:
+            r = mask2rle(predict)
+            encoded_pixels.append(r)
+
+    print("Saving submission...")
+    sub['EncodedPixels'] = encoded_pixels
+    sub.to_csv('ensembled_submission.csv', columns=['Image_Label', 'EncodedPixels'], index=False)
+    print("Saved.")
+
+
+ensemble_info = 0  # TODO
+
+# Generate test predictions
+with multiprocessing.Pool(1) as p:
+    result = p.map(generate_test_preds, [ensemble_info])
 
 
