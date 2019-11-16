@@ -249,9 +249,6 @@ ACTIVATION = None
 ENCODER_WEIGHTS = 'imagenet'
 DEVICE = 'cuda'
 
-# TODO: Create list/dictionary of logdirs with models we'd like to assemble
-# ENCODER = 'efficientnet-b2'
-# logdir = "./logs/segmentation"
 
 def generate_test_preds(ensemble_info):
 
@@ -311,6 +308,22 @@ def generate_test_preds(ensemble_info):
         image_id = 0
         for batch_index, test_batch in enumerate(tqdm.tqdm(test_loader)):
             runner_out = runner.predict_batch({"features": test_batch[0].cuda()})['logits'].cpu().detach().numpy()
+
+            # Applt TTA transforms
+            v_flip = test_batch[0].flip(dims=(2,))
+            h_flip = test_batch[0].flip(dims=(3,))
+            v_flip_out = runner.predict_batch({"features": v_flip.cuda()})['logits'].cpu().detach()
+            h_flip_out = runner.predict_batch({"features": h_flip.cuda()})['logits'].cpu().detach()
+            # Undo transforms
+            v_flip_out = v_flip_out.flip(dims=(2,)).numpy()
+            h_flip_out = h_flip_out.flip(dims=(3,)).numpy()
+            # Get average
+            tta_avg_out = (v_flip_out + h_flip_out) / 2
+
+            # Combine with original predictions
+            beta = 0.4  # From fastai TTA
+            runner_out = (beta) * runner_out + (1-beta) * tta_avg_out
+
             for preds in runner_out:
 
                 preds = preds.transpose((1, 2, 0))
@@ -340,7 +353,13 @@ def generate_test_preds(ensemble_info):
     print("Saved.")
 
 
-ensemble_info = 0  # TODO
+ensemble_files = ['fpn_model_info.npy']
+
+ensemble_info = []
+
+for file in ensemble_files:
+    ensemble_file = np.load(file, allow_pickle=True)
+    ensemble_info.extend(ensemble_file)
 
 # Generate test predictions
 with multiprocessing.Pool(1) as p:
