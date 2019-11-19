@@ -4,7 +4,6 @@ import tqdm
 import multiprocessing
 from multiprocessing import Process
 
-
 import numpy as np
 import pandas as pd
 import albumentations as albu
@@ -18,7 +17,7 @@ from torchvision.transforms import ToTensor
 
 import catalyst.utils as utils
 from catalyst.dl.runner import SupervisedRunner
-from catalyst.dl.callbacks import DiceCallback, EarlyStoppingCallback, InferCallback, CheckpointCallback
+from catalyst.dl.callbacks import DiceCallback, EarlyStoppingCallback, InferCallback, CheckpointCallback, CriterionCallback, OptimizerCallback
 
 script_name = os.path.basename(__file__).split('.')[0]
 MODEL_NAME = script_name
@@ -91,17 +90,17 @@ def get_training_augmentation():
         albu.ShiftScaleRotate(scale_limit=(0.1, 0.1), rotate_limit=45, p=0.5, border_mode=0),
         albu.GridDistortion(p=0.5),
         albu.RandomContrast(limit=0.3, p=0.5),
-        albu.Resize(704, 1056),
-        albu.RandomCrop(704, 704)
+        #albu.Resize(448, 672),
+        #albu.PadIfNeeded(352, 544, border_mode=0)
     ]
-
     return albu.Compose(train_transform)
 
 
 def get_validation_augmentation():
     """Add paddings to make image shape divisible by 32"""
     test_transform = [
-        albu.Resize(704, 1056)  # Validate/test on full size images
+        #albu.Resize(448, 672),
+        #albu.PadIfNeeded(352, 544, border_mode=0),
     ]
     return albu.Compose(test_transform)
 
@@ -164,7 +163,7 @@ def make_mask(encoded_masks, shape: tuple = (1400, 2100)):
     """
     Create mask based on df, image name and shape.
     """
-    masks = np.zeros((shape[0], shape[1], 4), dtype=np.float32)
+    masks = np.zeros((shape[0], shape[1], 4), dtype=np.uint8)
 
     for idx, label in enumerate(encoded_masks.values):
         if label is not np.nan:
@@ -195,7 +194,10 @@ class CloudDataset(Dataset):
         masks = []
         for image_name in tqdm.tqdm(self.img_ids):
             encoded_masks = self.df.loc[self.df['im_id'] == image_name, 'EncodedPixels']
-            masks.append(encoded_masks)
+            mask = make_mask(encoded_masks)
+            small_mask = cv2.resize(mask, (672, 448))
+            del mask
+            masks.append(small_mask)
 
         return masks
 
@@ -203,18 +205,19 @@ class CloudDataset(Dataset):
         samples = []
         for image_name in tqdm.tqdm(self.img_ids):
             img = get_img(image_name, self.data_folder)
+            img = cv2.resize(img, (672, 448))
             samples.append(img)
 
         return samples
 
     def __getitem__(self, idx):
-
-        img = self.samples[idx]
-
         if self.datatype != 'test':
-            encoded_masks = self.raw_masks[idx]
-            mask = make_mask(encoded_masks)
+            img = self.samples[idx]
+            mask = self.raw_masks[idx]
         else:
+            img_id = self.img_ids[idx]
+            img = get_img(img_id, self.data_folder)
+            img = cv2.resize(img, (672, 448))
             mask = np.zeros((img.shape[0], img.shape[1], 4), dtype=np.float32)
 
         augmented = self.transforms(image=img, mask=mask)
@@ -224,13 +227,20 @@ class CloudDataset(Dataset):
             preprocessed = self.preprocessing(image=img, mask=mask)
             img = preprocessed['image']
             mask = preprocessed['mask']
+
+        # We're resizing the mask because we're predicting with one less decoder
+        mask = mask.transpose((1, 2, 0))
+        mask = cv2.resize(mask, (672//2, 448//2))  # height and width are backward in cv2...
+        mask = mask.transpose((2, 0, 1))
         return img, mask
+
 
     def __len__(self):
         return len(self.img_ids)
 
     def _clear(self):
         del self.samples[:]
+
 
 train = pd.read_csv(f'data/train.csv')
 sub = pd.read_csv(f'data/sample_submission.csv')
@@ -246,7 +256,7 @@ id_mask_count = train.loc[train['EncodedPixels'].isnull() == False, 'Image_Label
 train_ids, valid_ids = train_test_split(id_mask_count['img_id'].values, random_state=42, stratify=id_mask_count['count'], test_size=0.1)
 test_ids = sub['Image_Label'].apply(lambda x: x.split('_')[0]).drop_duplicates().values
 logdir = "./logs/segmentation"
-ENCODER = 'resnet50'
+ENCODER = 'efficientnet-b4'
 ENCODER_WEIGHTS = 'imagenet'
 DEVICE = 'cuda'
 ACTIVATION = None
@@ -260,10 +270,11 @@ def train_model():
         classes=4,
         activation=ACTIVATION,
     )
+
     preprocessing_fn = smp.encoders.get_preprocessing_fn(ENCODER, ENCODER_WEIGHTS)
 
     num_workers = 0
-    bs = 6
+    bs = 5
     train_dataset = CloudDataset(df=train, datatype='train', img_ids=train_ids, transforms=get_training_augmentation(), preprocessing=get_preprocessing(preprocessing_fn))
     valid_dataset = CloudDataset(df=train, datatype='valid', img_ids=valid_ids, transforms=get_validation_augmentation(), preprocessing=get_preprocessing(preprocessing_fn))
 
@@ -275,7 +286,7 @@ def train_model():
         "valid": valid_loader
     }
 
-    num_epochs = 25
+    num_epochs = 40
 
     # model, criterion, optimizer
     optimizer = RAdam([
@@ -293,7 +304,7 @@ def train_model():
         optimizer=optimizer,
         scheduler=scheduler,
         loaders=loaders,
-        callbacks=[DiceCallback(), EarlyStoppingCallback(patience=5, min_delta=0.001)],
+        callbacks=[DiceCallback(), EarlyStoppingCallback(patience=5, min_delta=0.001), CriterionCallback(), OptimizerCallback(accumulation_steps=2)],
         logdir=logdir,
         num_epochs=num_epochs,
         verbose=True
@@ -453,3 +464,4 @@ with multiprocessing.Pool(1) as p:
     print(result)
 
 print("done")
+

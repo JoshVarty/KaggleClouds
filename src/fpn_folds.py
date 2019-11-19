@@ -29,7 +29,7 @@ if os.getcwd().endswith('src'):
 print("Working dir", os.getcwd())
 print("Model: {}".format(MODEL_NAME))
 
-NFOLDS = 5
+NFOLDS = 10
 RANDOM_STATE = 42
 script_name = os.path.basename(__file__).split('.')[0]
 skf = StratifiedKFold(n_splits=NFOLDS, random_state=RANDOM_STATE)
@@ -263,11 +263,11 @@ id_mask_count = train.loc[train['EncodedPixels'].isnull() == False, 'Image_Label
 test_ids = sub['Image_Label'].apply(lambda x: x.split('_')[0]).drop_duplicates().values
 
 
-ENCODER = 'efficientnet-b2'
+ENCODER = 'efficientnet-b3'
 ENCODER_WEIGHTS = 'imagenet'
 DEVICE = 'cuda'
 ACTIVATION = None
-LOG_DIR_BASE = './logs/fpn_segmentation_'
+LOG_DIR_BASE = './logs/8_fold_fpn_b3_segmentation_'
 
 
 def train_model(args):
@@ -285,7 +285,7 @@ def train_model(args):
     preprocessing_fn = smp.encoders.get_preprocessing_fn(ENCODER, ENCODER_WEIGHTS)
 
     num_workers = 0
-    bs = 10
+    bs = 6
     train_dataset = CloudDataset(df=train, datatype='train', img_ids=train_ids, transforms=get_training_augmentation(), preprocessing=get_preprocessing(preprocessing_fn))
     valid_dataset = CloudDataset(df=train, datatype='valid', img_ids=valid_ids, transforms=get_validation_augmentation(), preprocessing=get_preprocessing(preprocessing_fn))
 
@@ -500,32 +500,32 @@ def generate_test_preds(args):
     print("Saved.")
 
 
-#
-# i = 0
-#
-# # Persist valid preds to disk
-# valid_preds = np.zeros((len(train), 350, 525), dtype=np.float32)
-# np.save('data/valid_preds.npy', valid_preds)
-# del valid_preds
-#
-# for train_index, valid_index in skf.split(id_mask_count['img_id'].values, id_mask_count['count']):
-#     logdir = LOG_DIR_BASE + str(i)
-#
-#     train_ids = train.iloc[train_index * 4]['im_id']
-#     valid_ids = train.iloc[valid_index * 4]['im_id']
-#
-#     # Train model on fold
-#     with multiprocessing.Pool(1) as p:
-#         result = p.map(train_model, [(train_ids, valid_ids, logdir)])[0]
-#         print("Trained for fold ", str(i))
-#
-#     # Get validation predictions
-#     with multiprocessing.Pool(1) as p:
-#         result = p.map(generate_valid_preds, [(train_ids, valid_ids, logdir)])[0]
-#         print("Generated validation preds for ", str(i))
-#
-#     i = i + 1
-#
+
+i = 0
+
+# Persist valid preds to disk
+valid_preds = np.zeros((len(train), 350, 525), dtype=np.float32)
+np.save('data/valid_preds.npy', valid_preds)
+del valid_preds
+
+for train_index, valid_index in skf.split(id_mask_count['img_id'].values, id_mask_count['count']):
+    logdir = LOG_DIR_BASE + str(i)
+
+    train_ids = train.iloc[train_index * 4]['im_id']
+    valid_ids = train.iloc[valid_index * 4]['im_id']
+
+    # Train model on fold
+    with multiprocessing.Pool(1) as p:
+        result = p.map(train_model, [(train_ids, valid_ids, logdir)])[0]
+        print("Trained for fold ", str(i))
+
+    # Get validation predictions
+    with multiprocessing.Pool(1) as p:
+        result = p.map(generate_valid_preds, [(train_ids, valid_ids, logdir)])[0]
+        print("Generated validation preds for ", str(i))
+
+    i = i + 1
+
 
 # Get valid preds and optimize threshold and min_size
 class_params = {}
@@ -555,7 +555,7 @@ for i in range(NFOLDS):
     model_info.append(lookup)
 
 array = np.array(model_info)
-np.save('fpn_model_info.npy', array)
+np.save(LOG_DIR_BASE + '_fpn_b3_model_info.npy', array)
 
 print("done")
 

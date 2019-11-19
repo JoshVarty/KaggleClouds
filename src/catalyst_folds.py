@@ -3,7 +3,6 @@ import cv2
 import tqdm
 import multiprocessing
 from multiprocessing import Process
-from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -18,7 +17,17 @@ from torchvision.transforms import ToTensor
 
 import catalyst.utils as utils
 from catalyst.dl.runner import SupervisedRunner
-from catalyst.dl.callbacks import DiceCallback, EarlyStoppingCallback, InferCallback, CheckpointCallback, MixupCallback
+from catalyst.dl.callbacks import DiceCallback, EarlyStoppingCallback, InferCallback, CheckpointCallback
+
+script_name = os.path.basename(__file__).split('.')[0]
+MODEL_NAME = script_name
+
+if os.getcwd().endswith('src'):
+    # We want to be working in the root directory
+    os.chdir('../')
+
+print("Working dir", os.getcwd())
+print("Model: {}".format(MODEL_NAME))
 
 NFOLDS = 5
 RANDOM_STATE = 42
@@ -27,12 +36,6 @@ skf = StratifiedKFold(n_splits=NFOLDS, random_state=RANDOM_STATE)
 script_name = os.path.basename(__file__).split('.')[0]
 MODEL_NAME = "{0}__folds{1}".format(script_name, NFOLDS)
 
-if os.getcwd().endswith('src'):
-    # We want to be working in the root directory
-    os.chdir('../')
-
-print("Working dir", os.getcwd())
-print("Model: {}".format(MODEL_NAME))
 
 def rle_decode(mask_rle: str = '', shape: tuple = (1400, 2100)):
     """
@@ -94,8 +97,8 @@ def get_training_augmentation():
         albu.ShiftScaleRotate(scale_limit=(0.1, 0.1), rotate_limit=45, p=0.5, border_mode=0),
         albu.GridDistortion(p=0.5),
         albu.RandomContrast(limit=0.3, p=0.5),
-        albu.Resize(350, 525),
-        albu.PadIfNeeded(352, 544, border_mode=0)
+        #albu.Resize(448, 672),
+        #albu.PadIfNeeded(352, 544, border_mode=0)
     ]
     return albu.Compose(train_transform)
 
@@ -103,11 +106,10 @@ def get_training_augmentation():
 def get_validation_augmentation():
     """Add paddings to make image shape divisible by 32"""
     test_transform = [
-        albu.Resize(350, 525),
-        albu.PadIfNeeded(352, 544, border_mode=0)
+        #albu.Resize(448, 672),
+        #albu.PadIfNeeded(352, 544, border_mode=0),
     ]
     return albu.Compose(test_transform)
-
 
 
 def to_tensor(x, **kwargs):
@@ -168,11 +170,11 @@ def make_mask(encoded_masks, shape: tuple = (1400, 2100)):
     """
     Create mask based on df, image name and shape.
     """
-    masks = np.zeros((shape[0], shape[1], 4), dtype=np.float32)
+    masks = np.zeros((shape[0], shape[1], 4), dtype=np.uint8)
 
     for idx, label in enumerate(encoded_masks.values):
         if label is not np.nan:
-            mask = rle_decode(label, shape)
+            mask = rle_decode(label)
             masks[:, :, idx] = mask
 
     return masks
@@ -185,14 +187,13 @@ class CloudDataset(Dataset):
         self.df = df
         self.datatype = datatype
         self.img_ids = img_ids
-        self.mask_dir = f"data/train_images_annots_350x525"
         self.transforms = transforms
         self.preprocessing = preprocessing
-        # Optionally preload images for faster training
+
         if datatype != 'test':
             self.data_folder = f"data/train_images"
-            self.samples = self.load_samples()
             self.raw_masks = self.load_masks()
+            self.samples = self.load_samples()
         else:
             self.data_folder = f"data/test_images"
 
@@ -200,14 +201,18 @@ class CloudDataset(Dataset):
         masks = []
         for image_name in tqdm.tqdm(self.img_ids):
             encoded_masks = self.df.loc[self.df['im_id'] == image_name, 'EncodedPixels']
-            masks.append(encoded_masks)
+            mask = make_mask(encoded_masks)
+            small_mask = cv2.resize(mask, (672, 448))
+            del mask
+            masks.append(small_mask)
 
         return masks
 
     def load_samples(self):
         samples = []
-        for img_id in tqdm.tqdm(self.img_ids):
-            img = get_img(img_id, self.data_folder)
+        for image_name in tqdm.tqdm(self.img_ids):
+            img = get_img(image_name, self.data_folder)
+            img = cv2.resize(img, (672, 448))
             samples.append(img)
 
         return samples
@@ -216,11 +221,11 @@ class CloudDataset(Dataset):
 
         if self.datatype != 'test':
             img = self.samples[idx]
-            encoded_masks = self.raw_masks[idx]
-            mask = make_mask(encoded_masks)
+            mask = self.raw_masks[idx]
         else:
             img_id = self.img_ids[idx]
             img = get_img(img_id, self.data_folder)
+            img = cv2.resize(img, (672, 448))
             mask = np.zeros((img.shape[0], img.shape[1], 4), dtype=np.float32)
 
         augmented = self.transforms(image=img, mask=mask)
@@ -230,6 +235,11 @@ class CloudDataset(Dataset):
             preprocessed = self.preprocessing(image=img, mask=mask)
             img = preprocessed['image']
             mask = preprocessed['mask']
+
+        # We're resizing the mask because we're predicting with one less decoder
+        mask = mask.transpose((1, 2, 0))
+        mask = cv2.resize(mask, (672//2, 448//2))  # height and width are backward in cv2...
+        mask = mask.transpose((2, 0, 1))
         return img, mask
 
     def __len__(self):
@@ -237,6 +247,27 @@ class CloudDataset(Dataset):
 
     def _clear(self):
         del self.samples[:]
+
+
+train = pd.read_csv(f'data/train.csv')
+sub = pd.read_csv(f'data/sample_submission.csv')
+
+train['label'] = train['Image_Label'].apply(lambda x: x.split('_')[1])
+train['im_id'] = train['Image_Label'].apply(lambda x: x.split('_')[0])
+
+sub['label'] = sub['Image_Label'].apply(lambda x: x.split('_')[1])
+sub['im_id'] = sub['Image_Label'].apply(lambda x: x.split('_')[0])
+
+id_mask_count = train.loc[train['EncodedPixels'].isnull() == False, 'Image_Label'].apply(
+    lambda x: x.split('_')[0]).value_counts().reset_index().rename(columns={'index': 'img_id', 'Image_Label': 'count'})
+test_ids = sub['Image_Label'].apply(lambda x: x.split('_')[0]).drop_duplicates().values
+
+
+ENCODER = 'efficientnet-b3'
+ENCODER_WEIGHTS = 'imagenet'
+DEVICE = 'cuda'
+ACTIVATION = None
+LOG_DIR_BASE = './logs/unet_segmentation_'
 
 
 def train_model(args):
@@ -250,10 +281,11 @@ def train_model(args):
         classes=4,
         activation=ACTIVATION,
     )
-    preprocessing_fn = smp.encoders.get_preprocessing_fn(ENCODER, 'imagenet')
+
+    preprocessing_fn = smp.encoders.get_preprocessing_fn(ENCODER, ENCODER_WEIGHTS)
 
     num_workers = 0
-    bs = 16
+    bs = 6
     train_dataset = CloudDataset(df=train, datatype='train', img_ids=train_ids, transforms=get_training_augmentation(), preprocessing=get_preprocessing(preprocessing_fn))
     valid_dataset = CloudDataset(df=train, datatype='valid', img_ids=valid_ids, transforms=get_validation_augmentation(), preprocessing=get_preprocessing(preprocessing_fn))
 
@@ -265,7 +297,7 @@ def train_model(args):
         "valid": valid_loader
     }
 
-    num_epochs = 25
+    num_epochs = 40
 
     # model, criterion, optimizer
     optimizer = RAdam([
@@ -283,7 +315,7 @@ def train_model(args):
         optimizer=optimizer,
         scheduler=scheduler,
         loaders=loaders,
-        callbacks=[DiceCallback(), MixupCallback(alpha=0.4), EarlyStoppingCallback(patience=5, min_delta=0.001)],
+        callbacks=[DiceCallback(), EarlyStoppingCallback(patience=5, min_delta=0.001)],
         logdir=logdir,
         num_epochs=num_epochs,
         verbose=True
@@ -323,7 +355,10 @@ def generate_valid_preds(args):
 
     for im_id, preds in zip(valid_ids, runner.callbacks[0].predictions["logits"]):
 
-        preds = preds[:, :350, :525]
+        preds = preds.transpose((1, 2, 0))
+        preds = cv2.resize(preds, (525, 350))
+        preds = preds.transpose((2, 0, 1))
+
         indexes = train.index[train['im_id'] == im_id]
         valid_preds[indexes[0]] = preds[0]  # fish
         valid_preds[indexes[1]] = preds[1]  # flower
@@ -336,7 +371,6 @@ def generate_valid_preds(args):
 
 
 def get_valid_score(args):
-
     # Load predictions
     valid_preds = np.load('data/valid_preds.npy')
 
@@ -399,11 +433,12 @@ def generate_test_preds(args):
     test_preds = np.zeros((len(sub), 350, 525), dtype=np.float32)
 
     for i in range(NFOLDS):
-        logdir = "./logs/segmentation_" + str(i)
+        logdir = LOG_DIR_BASE + str(i)
 
-        preprocessing_fn = smp.encoders.get_preprocessing_fn(ENCODER, 'imagenet')
-        dummy_dataset = CloudDataset(df=sub, datatype='test', img_ids=test_ids[:1],  transforms=get_validation_augmentation(),
-                                    preprocessing=get_preprocessing(preprocessing_fn))
+        preprocessing_fn = smp.encoders.get_preprocessing_fn(ENCODER, ENCODER_WEIGHTS)
+        dummy_dataset = CloudDataset(df=sub, datatype='test', img_ids=test_ids[:1],
+                                     transforms=get_validation_augmentation(),
+                                     preprocessing=get_preprocessing(preprocessing_fn))
         dummy_loader = DataLoader(dummy_dataset, batch_size=1, shuffle=False, num_workers=0)
 
         model = smp.Unet(
@@ -427,6 +462,7 @@ def generate_test_preds(args):
             ],
         )
 
+
         # Now we do real inference on the full dataset
         test_dataset = CloudDataset(df=sub, datatype='test', img_ids=test_ids,  transforms=get_validation_augmentation(),
                                     preprocessing=get_preprocessing(preprocessing_fn))
@@ -436,7 +472,11 @@ def generate_test_preds(args):
         for batch_index, test_batch in enumerate(tqdm.tqdm(test_loader)):
             runner_out = runner.predict_batch({"features": test_batch[0].cuda()})['logits'].cpu().detach().numpy()
             for preds in runner_out:
-                preds = preds[:, :350, :525]
+
+                preds = preds.transpose((1, 2, 0))
+                preds = cv2.resize(preds, (525, 350))  # height and width are backward in cv2...
+                preds = preds.transpose((2, 0, 1))
+
                 idx = batch_index * 4
                 test_preds[idx + 0] += sigmoid(preds[0]) / NFOLDS  # fish
                 test_preds[idx + 1] += sigmoid(preds[1]) / NFOLDS  # flower
@@ -456,27 +496,10 @@ def generate_test_preds(args):
 
     print("Saving submission...")
     sub['EncodedPixels'] = encoded_pixels
-    sub.to_csv('submission_{}.csv'.format(valid_dice), columns=['Image_Label', 'EncodedPixels'], index=False)
+    sub.to_csv('unet_submission_{}.csv'.format(valid_dice), columns=['Image_Label', 'EncodedPixels'], index=False)
     print("Saved.")
 
 
-train = pd.read_csv(f'data/train.csv')
-sub = pd.read_csv(f'data/sample_submission.csv')
-
-train['label'] = train['Image_Label'].apply(lambda x: x.split('_')[1])
-train['im_id'] = train['Image_Label'].apply(lambda x: x.split('_')[0])
-
-sub['label'] = sub['Image_Label'].apply(lambda x: x.split('_')[1])
-sub['im_id'] = sub['Image_Label'].apply(lambda x: x.split('_')[0])
-
-id_mask_count = train.loc[train['EncodedPixels'].isnull() == False, 'Image_Label'].apply(
-    lambda x: x.split('_')[0]).value_counts().reset_index().rename(columns={'index': 'img_id', 'Image_Label': 'count'})
-test_ids = sub['Image_Label'].apply(lambda x: x.split('_')[0]).drop_duplicates().values
-
-ENCODER = 'resnet50'
-ENCODER_WEIGHTS = 'satellite-resnet-50'
-DEVICE = 'cuda'
-ACTIVATION = None
 
 i = 0
 
@@ -486,7 +509,7 @@ np.save('data/valid_preds.npy', valid_preds)
 del valid_preds
 
 for train_index, valid_index in skf.split(id_mask_count['img_id'].values, id_mask_count['count']):
-    logdir = "./logs/segmentation_" + str(i)
+    logdir = LOG_DIR_BASE + str(i)
 
     train_ids = train.iloc[train_index * 4]['im_id']
     valid_ids = train.iloc[valid_index * 4]['im_id']
@@ -503,6 +526,7 @@ for train_index, valid_index in skf.split(id_mask_count['img_id'].values, id_mas
 
     i = i + 1
 
+
 # Get valid preds and optimize threshold and min_size
 class_params = {}
 with multiprocessing.Pool(1) as p:
@@ -511,11 +535,27 @@ with multiprocessing.Pool(1) as p:
     print("Valid Dice", valid_dice)
     print("Got back", class_params)
 
-valid_dice = 0.5
-class_params = {0: (0.75, 10000), 1: (0.7, 10000), 2: (0.7, 10000), 3: (0.6, 10000)}
+
 # Generate test predictions
 with multiprocessing.Pool(1) as p:
     result = p.map(generate_test_preds, [(valid_dice, class_params)])
     print(result)
 
+
+# Save info
+model_info = []
+for i in range(NFOLDS):
+    lookup = {
+        'class_params': class_params,
+        'encoder': ENCODER,
+        'model_type': 'unet',
+        'logdir': LOG_DIR_BASE + (str(i))
+    }
+
+    model_info.append(lookup)
+
+array = np.array(model_info)
+np.save('unet_model_info.npy', array)
+
 print("done")
+

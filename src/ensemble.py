@@ -353,7 +353,8 @@ def generate_test_preds(ensemble_info):
     print("Saved.")
 
 
-ensemble_files = ['fpn_model_info.npy']
+# ensemble_files = ['fpn_model_info.npy', 'unet_model_info.npy']
+ensemble_files = ['8_fold_fpn_b3_segmentation__fpn_b3_model_info.npy']
 
 ensemble_info = []
 

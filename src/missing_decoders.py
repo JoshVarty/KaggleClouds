@@ -90,8 +90,8 @@ def get_training_augmentation():
         albu.ShiftScaleRotate(scale_limit=(0.1, 0.1), rotate_limit=45, p=0.5, border_mode=0),
         albu.GridDistortion(p=0.5),
         albu.RandomContrast(limit=0.3, p=0.5),
-        albu.Resize(350, 525),
-        albu.PadIfNeeded(352, 544, border_mode=0)
+        albu.Resize(352, 544),
+        #albu.PadIfNeeded(352, 544, border_mode=0)
     ]
     return albu.Compose(train_transform)
 
@@ -99,8 +99,8 @@ def get_training_augmentation():
 def get_validation_augmentation():
     """Add paddings to make image shape divisible by 32"""
     test_transform = [
-        albu.Resize(350, 525),
-        albu.PadIfNeeded(352, 544, border_mode=0),
+        albu.Resize(352, 544),
+        #albu.PadIfNeeded(352, 544, border_mode=0),
     ]
     return albu.Compose(test_transform)
 
@@ -163,7 +163,7 @@ def make_mask(encoded_masks, shape: tuple = (1400, 2100)):
     """
     Create mask based on df, image name and shape.
     """
-    masks = np.zeros((shape[0], shape[1], 4), dtype=np.float32)
+    masks = np.zeros((shape[0], shape[1], 4), dtype=np.uint8)
 
     for idx, label in enumerate(encoded_masks.values):
         if label is not np.nan:
@@ -194,7 +194,10 @@ class CloudDataset(Dataset):
         masks = []
         for image_name in tqdm.tqdm(self.img_ids):
             encoded_masks = self.df.loc[self.df['im_id'] == image_name, 'EncodedPixels']
-            masks.append(encoded_masks)
+            mask = make_mask(encoded_masks)
+            small_mask = cv2.resize(mask, (1400//2, 2100//2))
+            del mask
+            masks.append(small_mask)
 
         return masks
 
@@ -202,6 +205,7 @@ class CloudDataset(Dataset):
         samples = []
         for image_name in tqdm.tqdm(self.img_ids):
             img = get_img(image_name, self.data_folder)
+            img = cv2.resize(img, (1400//2, 2100//2))
             samples.append(img)
 
         return samples
@@ -211,8 +215,7 @@ class CloudDataset(Dataset):
         img = self.samples[idx]
 
         if self.datatype != 'test':
-            encoded_masks = self.raw_masks[idx]
-            mask = make_mask(encoded_masks)
+            mask = self.raw_masks[idx]
         else:
             mask = np.zeros((img.shape[0], img.shape[1], 4), dtype=np.float32)
 
@@ -226,7 +229,7 @@ class CloudDataset(Dataset):
 
         # We're resizing the mask because we're predicting with one less decoder
         mask = mask.transpose((1, 2, 0))
-        mask = cv2.resize(mask, (544//4, 352//4))  # height and width are backward in cv2...
+        mask = cv2.resize(mask, (544//2, 352//2))  # height and width are backward in cv2...
         mask = mask.transpose((2, 0, 1))
         return img, mask
 
